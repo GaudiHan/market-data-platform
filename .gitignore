@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+.env
+
+# Docker volumes are managed by Docker itself, not checked in
+*.log
