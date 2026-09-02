@@ -42,6 +42,19 @@ class IngestionManager:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
 
+    async def request_resync(self, exchange: str, symbol: str) -> None:
+        """Used by the order book layer to recover from a sequence gap
+        without tearing down the whole connection. Looks up the matching
+        client and delegates -- see ExchangeClient.trigger_resync."""
+        for client in self.clients:
+            if client.name == exchange:
+                try:
+                    await client.trigger_resync(symbol)
+                except Exception as exc:  # noqa: BLE001 -- a failed resync attempt shouldn't crash the pipeline
+                    logger.warning("resync request failed for %s %s: %s", exchange, symbol, exc)
+                return
+        logger.warning("request_resync: no client found for exchange '%s'", exchange)
+
     async def events(self):
         """Async generator over the merged event stream. A consumer just
         does `async for event in manager.events(): ...` without caring which

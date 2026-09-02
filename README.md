@@ -8,22 +8,18 @@ mechanical strategies against it with realistic execution simulation.
 Built to demonstrate database/schema design and market-microstructure
 understanding, not "call an API and plot a line."
 
-## Status: Layers 1 and 2 complete
+## Status: Layers 1, 2, and 3 complete
 
 | Layer | Status |
 |---|---|
 | 1. Ingestion (Binance + Coinbase WS) | Done, tested |
 | 2. Storage (TimescaleDB + Mongo) | Done, tested — writers + repository wired up |
-| 3. Order book reconstruction | Not started |
+| 3. Order book reconstruction | Done, tested — reconciliation + gap/resync handling |
 | 4. Backtesting engine | Not started |
 
-Test coverage as of Layer 2: **36 passed, 1 skipped** (37 total). The one
-skip is `test_mongo_index_usage.py`, which needs a real MongoDB to verify
-the compound index via `.explain()` — Ubuntu dropped the `mongodb-org`
-package over licensing, so it isn't installable in the sandbox these files
-were built in. It runs for real once you `docker compose up -d`. Everything
-else — including the TimescaleDB writer tests — ran against a real local
-Postgres 16 while building this, not just mocked.
+Test coverage as of Layer 3: **49 passed, 5 skipped** (54 total). Skips need
+live Postgres/Mongo (not installable in the sandbox these files were built
+in — see below); they run for real once you `docker compose up -d`.
 
 ## Zero-budget guarantee
 
@@ -34,10 +30,15 @@ Everything here runs on your own machine for $0:
   needed for trade/order-book data (only *trading* requires keys, which this
   project never does)
 
-One deliberate choice worth knowing about: Coinbase has two WebSocket APIs.
-The newer "Advanced Trade" API requires a signed JWT even for public data.
-This project uses the older public **Exchange** feed instead, specifically
-to avoid needing any account/credentials.
+One correction worth knowing about, **caught via a web search, not live
+testing** (this sandbox can't reach exchange domains, so I fact-checked
+instead): Coinbase's plain `level2` channel has required a signed API key
+since August 2023 — my original Layer 1 assumption that it was public was
+stale/wrong. The fix isn't to drop Coinbase order-book support, though:
+Coinbase documents `level2_batch` as an explicitly unauthenticated channel
+with identical `snapshot`/`l2update` message shapes (just batched every
+50ms server-side), so it's a one-line channel-name change with no parsing
+differences. See the docstring in `coinbase_client.py` for the full story.
 
 ## Setup
 
@@ -59,6 +60,17 @@ python -m scripts.run_ingestion
 You should see interleaved `[TRADE]`, `[SNAPSHOT]`, `[DIFF]`, and occasional
 `[CONN]` lines from both `binance` and `coinbase`. Ctrl+C to stop; it prints
 event counts on exit.
+
+To see the actual reconstructed order books rather than raw events:
+
+```bash
+python -m scripts.run_orderbook
+```
+
+Prints top-of-book (best bid/ask, spread, sync status) for both exchanges
+every 3 seconds. Watch the `[SYNCED]`/`[resyncing...]` tag — it should read
+`resyncing...` only briefly, right after startup, before settling to
+`SYNCED`.
 
 Run the test suite:
 
@@ -95,12 +107,12 @@ translated at the edge in `src/common/symbols.py` — that mapping decision
 **Order book gap-handling asymmetry (Binance vs. Coinbase)**: Binance's diff
 stream carries `U`/`u` update-ID fields that let you detect a sequence gap
 *within* a live connection and know exactly when to resync. Coinbase's
-public `level2` channel doesn't carry an equivalent sequence number — so gap
-detection there is connection-level only (any disconnect means a full resync
-on reconnect). This is documented in `coinbase_client.py` rather than
-papered over; the order book module (Layer 3, next) will treat "no snapshot
-yet" and "sequence gap detected" as the same trigger so both exchanges are
-handled correctly despite the asymmetry.
+`level2_batch` channel doesn't carry an equivalent sequence number — so gap
+detection there is connection-level only (any disconnect, or an explicit
+resync request, triggers a full resync). This is documented in
+`coinbase_client.py` rather than papered over; `src/orderbook` treats "no
+snapshot yet" and "sequence gap detected" as the same trigger so both
+exchanges are handled correctly despite the asymmetry.
 
 **Reconnection is not treated as exceptional**: `ExchangeClient.run_forever`
 in `src/ingestion/base.py` expects connections to drop — exchanges cycle
@@ -154,17 +166,54 @@ container creation, so anything that creates its own Mongo connection (tests,
 a fresh non-Docker deployment) needs an idempotent way to guarantee indexes
 exist rather than depending on container lifecycle timing.
 
+**Order book reconstruction is split into two layers on purpose**
+(`src/orderbook/book.py` vs. `src/orderbook/reconciler.py`): `OrderBook`
+is a dumb, exchange-agnostic price-level store (SortedDict per side,
+O(log n) updates) that just applies levels — it has no idea what a
+sequence gap is. All the "is this diff safe to apply, and what do we do if
+it isn't" logic lives in the reconciler, one layer up, because the two
+exchanges give genuinely different guarantees and that logic needs to
+differ per exchange without the book itself caring:
+- **Binance** diffs carry `U`/`u` (first/last update id), so
+  `BinanceReconciler` implements the documented procedure exactly: buffer
+  diffs while waiting for a REST snapshot, drop any diff already covered by
+  the snapshot, require the first applied diff to bridge
+  `U <= snapshot.lastUpdateId + 1 <= u`, and treat any later break in the
+  `U == previous.u + 1` chain as a gap that clears the book and triggers a
+  resync.
+- **Coinbase**'s `level2_batch` channel carries no sequence number at all
+  (see `coinbase_client.py`), so `CoinbaseReconciler` can't detect a gap
+  from the data itself — correctness there means "apply the snapshot, then
+  apply diffs in arrival order," leaning on connection-level resync (any
+  disconnect, or an explicit request) rather than sequence-level detection.
+
+**Resync doesn't require a full reconnect.** A Binance sequence gap can
+happen on an otherwise-healthy WebSocket connection, so the order book
+layer needed a way to ask ingestion for a fresh snapshot without tearing
+the connection down. `OrderBookRegistry` calls a `resync_cb` that's wired
+to `IngestionManager.request_resync()`, which dispatches to
+`ExchangeClient.trigger_resync()` — a new method added to the Layer 1
+`ExchangeClient` base class in this layer. Binance's implementation just
+re-runs the same REST snapshot fetch used on initial connect; Coinbase's
+re-sends a `level2_batch` subscribe message for the affected symbol, which
+makes the server push a fresh snapshot.
+
+One correction from Layer 1 surfaced while building this: the original
+`coinbase_client.py` docstring claimed the plain `level2` channel was
+public. That's been wrong since August 2023 — Coinbase now requires a
+signed API key for it. A web search (this sandbox can't reach exchange
+domains to test live) confirmed the fix: `level2_batch` is explicitly
+documented as unauthenticated and sends identical `snapshot`/`l2update`
+message shapes, so it was a one-line channel-name change, not a redesign.
+
 ## What's next (in order)
 
-1. **Order book reconstruction** — implement the actual Binance
-   snapshot+buffer+reconcile algorithm and the Coinbase resync-on-disconnect
-   path, both producing a queryable live L2 depth structure
-2. **Backtesting engine** — mean-reversion + momentum strategies, walk-forward
+1. **Backtesting engine** — mean-reversion + momentum strategies, walk-forward
    splitting, execution against the reconstructed book, Sharpe/max-drawdown
-3. **Remaining test suites** — correctness (order book vs. ground truth,
-   downsampling correctness), performance benchmarks (write throughput, query
-   latency, order-book update latency), backtest validity (lookahead-bias
-   check, slippage sanity), and the connection-kill chaos test
+2. **Remaining test suites** — downsampling correctness, performance
+   benchmarks (write throughput, query latency, order-book update latency),
+   backtest validity (lookahead-bias check, slippage sanity), and the
+   connection-kill chaos test
 
 ## Project layout
 
@@ -182,26 +231,32 @@ market-data-platform/
 │   │   ├── events.py            # normalized event types (the cross-layer contract)
 │   │   └── symbols.py           # BASE-QUOTE <-> exchange-native mapping
 │   ├── ingestion/
-│   │   ├── base.py              # reconnect/backoff contract every client follows
+│   │   ├── base.py              # reconnect/backoff contract + trigger_resync() hook
 │   │   ├── binance_client.py
-│   │   ├── coinbase_client.py
-│   │   └── manager.py           # runs both concurrently, merges into one stream
+│   │   ├── coinbase_client.py   # uses level2_batch (unauthenticated) for L2 depth
+│   │   └── manager.py           # runs both concurrently, merges into one stream, request_resync()
 │   ├── storage/
 │   │   ├── timescale/writer.py   # batched trade inserts + COPY for book events
 │   │   └── mongo/
 │   │       ├── models.py         # Watchlist / Portfolio / AlertRule dataclasses
 │   │       └── repository.py     # CRUD + hot-path queries, ensure_indexes()
-│   ├── orderbook/                # (next)
+│   ├── orderbook/
+│   │   ├── book.py               # exchange-agnostic L2 price-level store
+│   │   ├── reconciler.py         # per-exchange gap/out-of-order handling + resync trigger
+│   │   └── manager.py            # routes ingestion events to per (exchange,symbol) reconcilers
 │   └── backtest/                 # (next)
 ├── scripts/
 │   ├── run_ingestion.py         # Layer 1 only: sanity-check the raw feed
-│   └── run_pipeline.py          # Layer 1 + 2: ingestion streaming into TimescaleDB
+│   ├── run_pipeline.py          # Layer 1 + 2: ingestion streaming into TimescaleDB
+│   └── run_orderbook.py         # Layer 1 + 3: live top-of-book printer
 └── tests/
     ├── correctness/
     │   ├── test_symbols.py
-    │   ├── test_timescale_writer.py     # verified against real Postgres
-    │   ├── test_mongo_repository.py     # verified against mongomock
-    │   └── test_mongo_index_usage.py    # verified against real Mongo (skips otherwise)
+    │   ├── test_timescale_writer.py         # verified against real Postgres
+    │   ├── test_mongo_repository.py         # verified against mongomock
+    │   ├── test_mongo_index_usage.py        # verified against real Mongo (skips otherwise)
+    │   ├── test_orderbook.py                # order book vs. ground truth
+    │   └── test_orderbook_reconciliation.py # out-of-order/gap handling, both exchanges
     ├── performance/
     ├── backtest_validity/
     ├── chaos/

@@ -1,20 +1,32 @@
 """
 Coinbase ingestion client, using the public "Exchange" WebSocket feed
-(wss://ws-feed.exchange.coinbase.com). Deliberately NOT the newer "Advanced
-Trade" WS API -- that one requires a signed JWT even for public market data,
-which doesn't fit the zero-budget/no-account constraint. The Exchange feed's
-`matches` and `level2` channels are public and anonymous.
+(wss://ws-feed.exchange.coinbase.com).
 
-Known asymmetry vs. Binance (documented here rather than hidden): the
-`level2` channel does not carry a per-message sequence/update-id the way
-Binance's depth diffs carry U/u. That means Coinbase-side gap *detection*
-mid-stream isn't possible from this channel alone -- the practical resync
-strategy is connection-level: any disconnect/error triggers a fresh
-subscribe + snapshot, discarding prior book state. Binance additionally
-supports true sequence-gap detection within a live connection. Both paths
-converge in src/orderbook, which treats "no snapshot seen yet" and "sequence
-gap detected" as the same trigger: throw away local state, wait for next
-snapshot.
+Correction from what Layer 1 originally assumed: Coinbase's plain `level2`
+channel has required authentication (a signed API key) since August 1,
+2023 -- confirmed against current Coinbase docs
+(https://docs.cdp.coinbase.com/exchange/websocket-feed/authentication).
+The original Layer 1 docstring claiming `level2` was public was wrong;
+that's stale information, not something the sandbox's network restrictions
+could have caught directly (no outbound to exchange domains here), but
+verifiable -- and verified -- via a web search instead.
+
+The fix is NOT to drop order-book reconstruction for Coinbase, which would
+have been a bigger change than necessary: Coinbase also documents
+`level2_batch` (the current name for what used to be called `level2_50`),
+which is explicitly called out as NOT requiring authentication and sends
+the exact same message shapes (`snapshot` then `l2update`), just batched
+every 50ms server-side rather than pushed per individual change. That's a
+one-line channel-name change with no parsing differences at all, so the
+order-book reconciliation logic built in Layer 3 applies unmodified.
+
+Known asymmetry vs. Binance (unchanged from the original design): neither
+`level2` nor `level2_batch` carries a per-message sequence/update-id the
+way Binance's depth diffs carry U/u. That means Coinbase-side gap
+*detection* mid-stream isn't possible from this channel alone -- the
+practical resync strategy is connection-level: any disconnect/error, or an
+explicit resync request, triggers a fresh subscribe + snapshot, discarding
+prior book state.
 """
 from __future__ import annotations
 
@@ -33,6 +45,11 @@ logger = logging.getLogger(__name__)
 
 WS_URL = "wss://ws-feed.exchange.coinbase.com"
 
+# Public, anonymous channels only. Plain "level2" (and "level3"/"full")
+# require a signed API key as of Aug 2023 -- see module docstring.
+# "level2_batch" gives identical message shapes without authentication.
+PUBLIC_CHANNELS = ["matches", "level2_batch"]
+
 
 class CoinbaseClient(ExchangeClient):
     name = "coinbase"
@@ -42,14 +59,32 @@ class CoinbaseClient(ExchangeClient):
         subscribe_msg = {
             "type": "subscribe",
             "product_ids": native_symbols,
-            "channels": PUBLIC_CHANNELS # ["matches", "level2"],
+            "channels": PUBLIC_CHANNELS,
         }
 
         async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
+            self._ws = ws
             await ws.send(orjson.dumps(subscribe_msg).decode())
             await self._emit_connection_event("connected")
             async for raw in ws:
                 self._handle_message(raw)
+
+    async def trigger_resync(self, symbol: str) -> None:
+        """Coinbase's level2_batch channel has no sequence number to detect
+        a gap with (see module docstring) -- but re-sending a `subscribe`
+        for this product's level2_batch channel makes the server push a
+        brand-new snapshot message, which is enough to recover from "we're
+        not sure our local state is right" without a full reconnect.
+        Requires the connection to still be open; if it isn't, the normal
+        reconnect-and-resubscribe path in _connect_and_stream will get a
+        fresh snapshot anyway."""
+        if self._ws is None:
+            logger.warning("coinbase: trigger_resync called with no live connection, symbol=%s", symbol)
+            return
+        native_symbol = to_coinbase(symbol)
+        msg = {"type": "subscribe", "product_ids": [native_symbol], "channels": ["level2_batch"]}
+        logger.info("coinbase: resync requested for %s, re-subscribing to level2_batch", symbol)
+        await self._ws.send(orjson.dumps(msg).decode())
 
     def _handle_message(self, raw: str | bytes) -> None:
         try:
@@ -109,7 +144,7 @@ class CoinbaseClient(ExchangeClient):
             symbol=common_symbol,
             bids=bids,
             asks=asks,
-            last_update_id=None,  # Coinbase level2 carries no update id -- see module docstring
+            last_update_id=None,  # level2_batch carries no update id -- see module docstring
         )
         self.out_queue.put_nowait(snapshot)
 

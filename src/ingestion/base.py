@@ -28,6 +28,7 @@ class ExchangeClient(abc.ABC):
         self._stop = asyncio.Event()
         self._max_backoff_s = 30.0
         self._base_backoff_s = 1.0
+        self._ws = None  # live connection handle, set by _connect_and_stream; used by trigger_resync
 
     async def run_forever(self) -> None:
         """Connect, stream, and reconnect with exponential backoff + jitter
@@ -61,6 +62,14 @@ class ExchangeClient(abc.ABC):
         raise (not swallow) on connection failure so run_forever's retry
         loop can handle it centrally."""
         raise NotImplementedError
+
+    async def trigger_resync(self, symbol: str) -> None:
+        """Ask this client to obtain a fresh snapshot for `symbol` WITHOUT
+        necessarily tearing down the whole connection -- this is what lets
+        the order book layer recover from a sequence gap (Binance) while the
+        websocket itself is still healthy. Default: unsupported; subclasses
+        override where the exchange makes this possible."""
+        logger.warning("%s: trigger_resync not supported for this client", self.name)
 
     async def _emit_connection_event(self, kind: str, detail: str = "", symbol: str = "*") -> None:
         from src.common.events import ConnectionEvent  # local import avoids cycle risk

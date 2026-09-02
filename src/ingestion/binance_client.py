@@ -6,12 +6,24 @@ Streams: combined trade + diff-depth streams over one WebSocket connection
 
 Order book note: Binance's own documented procedure for building a correct
 local book is:
-  1. Start buffering diff events from <symbol>@depth
-  2. Fetch a REST snapshot (GET /api/v3/depth) with its own lastUpdateId
+  1. Start buffering diff events from <symbol>@depth FIRST
+  2. THEN fetch a REST snapshot (GET /api/v3/depth) with its own lastUpdateId
   3. Discard any buffered diff where diff.u <= snapshot.lastUpdateId
   4. The first diff you apply must satisfy U <= lastUpdateId+1 <= u
   5. Every next diff's U must equal the previous diff's u + 1, or you have a
      gap and must resync from a fresh snapshot.
+
+That ordering in step 1/2 is load-bearing, not incidental: the snapshot
+must be fetched *while* diffs are already being buffered, so the buffered
+diffs span across the snapshot's lastUpdateId and step 4's bridging
+condition can actually be satisfied. Fetching the snapshot before opening
+the stream (which an earlier version of this file did) means the first
+diff received after connecting always has U far ahead of
+lastUpdateId + 1 -- the bridge condition can never be true, and the order
+book layer sits in "resyncing" forever. This client fires the snapshot
+fetch as a background task immediately after entering the message loop,
+not before it, specifically to get that ordering right.
+
 This client's job is only to produce the raw, faithfully-normalized events
 (snapshot once at start, diffs continuously) with U/u intact. The gap
 detection and reconciliation algorithm itself lives in src/orderbook -- that's
@@ -21,6 +33,7 @@ in a network client.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 
@@ -49,20 +62,44 @@ class BinanceClient(ExchangeClient):
             streams.append(f"{ns}@depth@100ms")
         url = f"{WS_BASE}?streams={'/'.join(streams)}"
 
-        # Fetch a fresh REST snapshot for every symbol before/around the
-        # streaming connection so the order book layer always has a known
-        # starting point to reconcile diffs against -- both on first start
-        # and after any reconnect.
-        for common_symbol in self.symbols:
-            await self._fetch_and_emit_snapshot(common_symbol)
-
         logger.info("binance: connecting to %s", url)
         async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+            self._ws = ws
             await self._emit_connection_event("connected")
-            async for raw in ws:
-                self._handle_message(raw)
 
-    async def _fetch_and_emit_snapshot(self, common_symbol: str) -> None:
+            # Fetch snapshots CONCURRENTLY with receiving the message loop
+            # below, not before it -- see module docstring for why the order
+            # matters. Diffs that arrive while these REST calls are in
+            # flight get buffered by the order-book layer and will span
+            # across each snapshot's lastUpdateId once it lands.
+            snapshot_task = asyncio.create_task(self._fetch_all_snapshots())
+            try:
+                async for raw in ws:
+                    self._handle_message(raw)
+            finally:
+                snapshot_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await snapshot_task
+
+    async def _fetch_all_snapshots(self) -> None:
+        for common_symbol in self.symbols:
+            try:
+                await self._fetch_snapshot_impl(common_symbol)
+            except Exception:  # noqa: BLE001 -- a failed snapshot fetch must not kill the stream
+                logger.exception("binance: snapshot fetch failed for %s", common_symbol)
+
+    async def trigger_resync(self, symbol: str) -> None:
+        """Called by the order book layer mid-stream (no reconnect needed)
+        when it detects a sequence gap. Since the WebSocket is already open
+        and diffs are already flowing by this point, there's no ordering
+        hazard here the way there is on initial connect -- just re-fetch."""
+        logger.info("binance: resync requested for %s, fetching fresh snapshot", symbol)
+        try:
+            await self._fetch_snapshot_impl(symbol)
+        except Exception:  # noqa: BLE001
+            logger.exception("binance: resync snapshot fetch failed for %s", symbol)
+
+    async def _fetch_snapshot_impl(self, common_symbol: str) -> None:
         native_symbol = to_binance(common_symbol).upper()
         async with aiohttp.ClientSession() as session:
             async with session.get(
