@@ -42,7 +42,7 @@ class CoinbaseClient(ExchangeClient):
         subscribe_msg = {
             "type": "subscribe",
             "product_ids": native_symbols,
-            "channels": ["matches", "level2"],
+            "channels": PUBLIC_CHANNELS # ["matches", "level2"],
         }
 
         async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
