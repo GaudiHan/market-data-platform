@@ -8,7 +8,7 @@ mechanical strategies against it with realistic execution simulation.
 Built to demonstrate database/schema design and market-microstructure
 understanding, not "call an API and plot a line."
 
-## Status: All four layers complete, plus performance benchmarks
+## Status: All four layers complete, plus performance benchmarks and a chaos test
 
 | Layer | Status |
 |---|---|
@@ -17,8 +17,9 @@ understanding, not "call an API and plot a line."
 | 3. Order book reconstruction | Done, tested — reconciliation + gap/resync handling |
 | 4. Backtesting engine | Done, tested — walk-forward, order-book execution, risk-adjusted metrics |
 | Performance benchmarks | Done — write throughput, query latency, order-book update latency |
+| Chaos test: connection kill mid-stream | Done — real local socket, both exchanges |
 
-Test coverage: **100 passed, 1 skipped** (101 total). The one skip needs
+Test coverage: **108 passed, 1 skipped** (109 total). The one skip needs
 live Postgres/Mongo not installable in the sandbox these files were built
 in (see below); it runs for real once you `docker compose up -d`.
 
@@ -338,10 +339,38 @@ correctness test (both versions return the same answer) and only shows up
 when you actually measure. The benchmark's ceiling was tightened
 afterward specifically so the slow version would fail it if reintroduced.
 
+**The connection-kill chaos test runs against a real local socket, not
+mocked objects** (`tests/chaos/test_connection_kill.py`,
+`test_connection_kill_coinbase.py`): a real `websockets.serve()` server and
+a real `aiohttp` HTTP server stand in for the exchange, `BinanceClient`/
+`CoinbaseClient` connect to them for real over localhost, and the fake
+server abruptly kills the connection with a policy-violation close code
+(1011) mid-stream — the closest a portable automated test gets to "yanked
+the network cable." The test then proves the specific claim the assignment
+asks for, not just "it reconnected": a large, unmistakable price jump is
+baked into the *second* snapshot fetch (simulating the market having moved
+during the outage), and the test asserts the book afterward contains
+**only** that new price regime, with the pre-kill price level completely
+absent — not overwritten, not lingering alongside the new state, gone.
+That's the concrete meaning of "without corrupting downstream data" here.
+
+Building this test surfaced a real bug in `src/ingestion/base.py`, found
+before any live network was involved: `websockets`' async iterator returns
+*normally* (no exception) on a clean WebSocket close (code 1000/1001) —
+only abnormal closes raise. `run_forever` only emitted its `disconnected`
+ConnectionEvent from the exception branch, so a graceful server-side close
+would leave the order book layer believing nothing happened, silently
+serving stale state as "synced" until a snapshot happened to arrive.
+Fixed by emitting the event on both exit paths — caught by a fast,
+network-free unit test (`tests/chaos/test_reconnect_base.py`) before the
+slower real-socket test ever ran, which is exactly the point of having
+both: the unit tests pin down `run_forever`'s own logic precisely and
+cheaply, the real-socket tests prove the whole stack recovers end-to-end.
+
 ## What's next (in order)
 
-The four layers from the original scope, plus performance benchmarks, are
-complete. What's left is polish:
+The four layers from the original scope, performance benchmarks, and both
+chaos-test categories are complete. What's left is polish:
 
 1. **Wire OrderBookReplayer into scripts/run_backtest.py** — currently the
    backtest runs with the documented flat-slippage fallback because it
@@ -358,13 +387,7 @@ complete. What's left is polish:
    sizing, but the sizing itself isn't a sane default. Worth switching to
    fraction-of-equity sizing (e.g. risk a fixed % of current equity per
    trade) before treating any Sharpe/drawdown numbers as meaningful.
-3. **Chaos test for the connection-kill scenario** — the malformed-message
-   half of chaos testing is done (Layer 1); "kill the WebSocket mid-stream,
-   assert clean resync" is best exercised as a semi-manual test against a
-   live connection (a mocked reconnect doesn't prove much) — worth writing
-   up as a documented manual test procedure alongside whatever automated
-   coverage is practical.
-4. **A thin API/CLI layer** over the Mongo repository (watchlists/alerts)
+3. **A thin API/CLI layer** over the Mongo repository (watchlists/alerts)
    and the backtest engine, if you want this to be demoable end-to-end
    rather than script-by-script.
 
@@ -437,7 +460,10 @@ market-data-platform/
     │   ├── test_slippage_fees.py          # fee proportionality, slippage vs. book depth
     │   └── test_benchmark_comparison.py   # buy-and-hold baseline + Sharpe/drawdown correctness
     ├── chaos/
-    │   └── test_malformed_messages.py   # done: malformed-payload handling
+    │   ├── test_malformed_messages.py       # malformed-payload handling (Layer 1)
+    │   ├── test_reconnect_base.py           # fast, network-free: run_forever's reconnect/backoff logic
+    │   ├── test_connection_kill.py          # real local socket: Binance kill + resync end-to-end
+    │   └── test_connection_kill_coinbase.py # same, for Coinbase's no-sequence-number resync path
     └── fixtures/
         └── plain_schema.sql             # Timescale schema mirrored for plain-Postgres testing
 ```
