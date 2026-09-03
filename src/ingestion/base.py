@@ -35,12 +35,24 @@ class ExchangeClient(abc.ABC):
         on any failure, until stop() is called. A dropped connection is
         expected/normal operating behavior here, not an exceptional case --
         exchanges cycle connections, networks blip. We log it, emit a
-        ConnectionEvent so downstream consumers know to resync, and retry."""
+        ConnectionEvent so downstream consumers know to resync, and retry.
+
+        Both exit paths from _connect_and_stream() count as a disconnection
+        for this purpose, not just the exceptional one: `websockets`' async
+        iterator returns normally (no exception) on a clean close (code
+        1000/1001), so a graceful server-side close would otherwise leave
+        the order book layer believing it's still synced against a feed
+        that already stopped -- serving stale state with no signal that
+        anything happened. Both branches below emit the same
+        'disconnected' event; only the retry delay differs (immediate for a
+        clean close, backed off for an actual error)."""
         backoff = self._base_backoff_s
         while not self._stop.is_set():
             try:
                 await self._connect_and_stream()
-                backoff = self._base_backoff_s  # reset after a clean run
+                logger.info("%s: connection closed cleanly, reconnecting", self.name)
+                await self._emit_connection_event("disconnected", "clean close")
+                backoff = self._base_backoff_s  # not a failure -- reconnect immediately
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 -- intentionally broad at this boundary
