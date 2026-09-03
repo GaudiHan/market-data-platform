@@ -50,6 +50,12 @@ logger = logging.getLogger(__name__)
 WS_BASE = "wss://stream.binance.com:9443/stream"
 REST_DEPTH_URL = "https://api.binance.com/api/v3/depth"
 
+# See the matching constant in coinbase_client.py for why this is raised
+# above `websockets`' 1MB default -- Binance diffs are normally small, but
+# there's no reason to leave this fragile against an occasional large
+# combined-stream message.
+MAX_WS_MESSAGE_BYTES = 20 * 1024 * 1024
+
 
 class BinanceClient(ExchangeClient):
     name = "binance"
@@ -63,7 +69,9 @@ class BinanceClient(ExchangeClient):
         url = f"{WS_BASE}?streams={'/'.join(streams)}"
 
         logger.info("binance: connecting to %s", url)
-        async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+        async with websockets.connect(
+            url, ping_interval=20, ping_timeout=20, max_size=MAX_WS_MESSAGE_BYTES
+        ) as ws:
             self._ws = ws
             await self._emit_connection_event("connected")
 

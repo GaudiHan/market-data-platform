@@ -45,6 +45,16 @@ logger = logging.getLogger(__name__)
 
 WS_URL = "wss://ws-feed.exchange.coinbase.com"
 
+# `websockets`' default max message size is 1MB, and it closes the
+# connection (code 1009) rather than truncate when a message exceeds it.
+# A level2_batch snapshot for a liquid pair like BTC-USD can carry
+# thousands of price levels in one JSON message and blow past 1MB easily --
+# without raising this, the client would loop forever: connect, receive the
+# oversized snapshot, get disconnected, reconnect, repeat. 20MB is generous
+# headroom without being unbounded (avoids one pathological message being
+# able to exhaust memory).
+MAX_WS_MESSAGE_BYTES = 20 * 1024 * 1024
+
 # Public, anonymous channels only. Plain "level2" (and "level3"/"full")
 # require a signed API key as of Aug 2023 -- see module docstring.
 # "level2_batch" gives identical message shapes without authentication.
@@ -62,7 +72,9 @@ class CoinbaseClient(ExchangeClient):
             "channels": PUBLIC_CHANNELS,
         }
 
-        async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
+        async with websockets.connect(
+            WS_URL, ping_interval=20, ping_timeout=20, max_size=MAX_WS_MESSAGE_BYTES
+        ) as ws:
             self._ws = ws
             await ws.send(orjson.dumps(subscribe_msg).decode())
             await self._emit_connection_event("connected")

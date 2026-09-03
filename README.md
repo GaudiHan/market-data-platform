@@ -12,9 +12,9 @@ understanding, not "call an API and plot a line."
 
 | Layer | Status |
 |---|---|
-| 1. Ingestion (Binance + Coinbase WS) | Done, tested |
-| 2. Storage (TimescaleDB + Mongo) | Done, tested — writers + repository wired up |
-| 3. Order book reconstruction | Done, tested — reconciliation + gap/resync handling |
+| 1. Ingestion (Binance + Coinbase WS) | tested |
+| 2. Storage (TimescaleDB + Mongo) | tested |
+| 3. Order book reconstruction | tested |
 | 4. Backtesting engine | Not started |
 
 Test coverage as of Layer 3: **49 passed, 5 skipped** (54 total). Skips need
