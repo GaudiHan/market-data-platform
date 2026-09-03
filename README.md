@@ -8,18 +8,19 @@ mechanical strategies against it with realistic execution simulation.
 Built to demonstrate database/schema design and market-microstructure
 understanding, not "call an API and plot a line."
 
-## Status: Layers 1, 2, and 3 complete
+## Status: All four layers complete, plus performance benchmarks
 
 | Layer | Status |
 |---|---|
-| 1. Ingestion (Binance + Coinbase WS) | tested |
-| 2. Storage (TimescaleDB + Mongo) | tested |
-| 3. Order book reconstruction | tested |
-| 4. Backtesting engine | Not started |
+| 1. Ingestion (Binance + Coinbase WS) | Done, tested |
+| 2. Storage (TimescaleDB + Mongo) | Done, tested — writers + repository wired up |
+| 3. Order book reconstruction | Done, tested — reconciliation + gap/resync handling |
+| 4. Backtesting engine | Done, tested — walk-forward, order-book execution, risk-adjusted metrics |
+| Performance benchmarks | Done — write throughput, query latency, order-book update latency |
 
-Test coverage as of Layer 3: **49 passed, 5 skipped** (54 total). Skips need
-live Postgres/Mongo (not installable in the sandbox these files were built
-in — see below); they run for real once you `docker compose up -d`.
+Test coverage: **100 passed, 1 skipped** (101 total). The one skip needs
+live Postgres/Mongo not installable in the sandbox these files were built
+in (see below); it runs for real once you `docker compose up -d`.
 
 ## Zero-budget guarantee
 
@@ -72,6 +73,17 @@ every 3 seconds. Watch the `[SYNCED]`/`[resyncing...]` tag — it should read
 `resyncing...` only briefly, right after startup, before settling to
 `SYNCED`.
 
+To run a backtest (works immediately with zero setup via a free historical
+data pull, or synthetic data as a last resort):
+
+```bash
+python -m scripts.backfill_binance_klines --symbol BTC-USD --interval 1h
+python -m scripts.run_backtest --symbol BTC-USD --interval 1h
+```
+
+Prints walk-forward fold-by-fold results for both strategies: return,
+Sharpe, max drawdown, and a buy-and-hold benchmark for comparison.
+
 Run the test suite:
 
 ```bash
@@ -89,6 +101,15 @@ services and skip cleanly if they're not reachable:
   just set `TEST_POSTGRES_DSN` to reuse the main `marketdata` DB).
 - `tests/correctness/test_mongo_index_usage.py` — needs real MongoDB (see
   status table above for why). Defaults to matching `docker-compose`'s Mongo.
+- `tests/correctness/test_orderbook_replay.py`, `tests/performance/*` — same
+  Postgres dependency as the writer tests above.
+
+To see the actual benchmark numbers rather than just pass/fail (the perf
+tests print, but pytest swallows stdout by default):
+
+```bash
+pytest tests/performance -v -s
+```
 
 ## Architecture decisions worth knowing about
 
@@ -206,20 +227,130 @@ domains to test live) confirmed the fix: `level2_batch` is explicitly
 documented as unauthenticated and sends identical `snapshot`/`l2update`
 message shapes, so it was a one-line channel-name change, not a redesign.
 
+**Snapshot-fetch ordering bug, found via your live test, not mine**: the
+first version of `binance_client.py` fetched the REST snapshot *before*
+opening the WebSocket depth stream. That's backwards from Binance's
+documented procedure — you're supposed to start receiving diffs first, so
+the ones buffered during the REST round-trip span across the snapshot's
+`lastUpdateId` and can bridge into it. Fetching the snapshot first means
+every diff received afterward has an update-id permanently ahead of
+`lastUpdateId + 1`, so the bridge condition in `BinanceReconciler` can never
+be satisfied — the book sits in "resyncing" forever, which is exactly what
+running `scripts/run_orderbook.py` surfaced. Fixed by firing the snapshot
+fetch as a background task *after* entering the WebSocket message loop
+instead of before it. This is the kind of timing bug that's basically
+invisible to unit tests (the reconciler logic itself was already correct
+and already tested) and only shows up against a real, live feed — which is
+exactly why I asked you to run it rather than trusting the test suite alone.
+
+**Coinbase disconnect loop from oversized snapshot messages, also found via
+your live test**: `websockets` closes the connection (code 1009) rather
+than truncate when an incoming message exceeds its default 1MB limit. A
+`level2_batch` snapshot for a liquid pair like BTC-USD carries thousands of
+price levels in one JSON message and routinely exceeds that — so the
+client was stuck looping connect → oversized snapshot → disconnect →
+reconnect, forever. Fixed by raising `max_size` to 20MB on both exchange
+clients' `websockets.connect()` calls (generous headroom, not unbounded).
+
+**Lookahead bias is prevented by construction, not by discipline**
+(`src/backtest/engine.py`, `strategies/base.py`): `BacktestEngine.run` always
+calls `strategy.generate_signal(bars.iloc[:i+1])` — a slice ending at the
+current bar, never the full frame. A strategy implementation literally
+cannot read a future bar because it's never in the object it's holding.
+`tests/backtest_validity/test_lookahead.py` verifies this the way that
+actually matters: it corrupts every bar after a fixed decision point with
+wildly different prices and confirms the signal at that point doesn't
+change. That test would fail immediately if anyone ever passed the strategy
+the whole `bars` frame instead of a truncated slice.
+
+**Execution is simulated by walking the reconstructed order book, not a
+flat slippage assumption** (`src/backtest/execution.py`): a market order
+consumes resting size level by level from the best price outward, exactly
+like a real exchange fills it — so slippage is a genuine output of book
+depth, not an input the backtest assumes. `OrderBookReplayer`
+(`src/orderbook/replay.py`) rebuilds historical book state from the
+persisted `book_events` log up to a cutoff timestamp, deliberately never
+touching the live reconciler (replaying already-validated history has no
+sequencing uncertainty to resolve — that's what the reconciler exists for on
+the live path). `scripts/run_backtest.py` doesn't wire this in yet by
+default, since it needs `book_events` history reaching back over the bars
+under test, which takes time to accumulate; it falls back to a documented
+flat-slippage model per bar until then (see `FALLBACK_SLIPPAGE_BPS` in
+`engine.py`) rather than silently pretending the execution is realistic
+when it isn't.
+
+**Walk-forward splitting exists even though the strategies don't fit
+parameters** (`src/backtest/walkforward.py`): the strategies here are
+mechanical (fixed lookback/thresholds), so there's nothing to "train" in
+the traditional sense. The splitter still matters because it's the
+mechanism that enforces sequential, non-overlapping evaluation windows
+rather than scoring a strategy against one big shuffled blob of history —
+and it's ready to support real parameter search later (the interface
+doesn't change) without needing a redesign.
+
+**Fees are a fixed rate; slippage is not** (`src/backtest/costs.py` vs.
+`execution.py`): a taker fee really is a fixed percentage of notional, so
+that's modeled as a constant. Slippage is never modeled as a flat
+percentage — it's whatever the order-book walk actually produces, because a
+backtest that assumes a slippage number is just moving the same
+optimism-bias problem one level down.
+
+**Zero-cost historical data, so the backtest is runnable immediately**
+(`scripts/backfill_binance_klines.py`): pulls OHLCV bars straight from
+Binance's public REST klines endpoint — no key, no account, same
+constraint as everything else in this project — into a local CSV that
+`CsvBarsSource` reads. Without this, testing the backtest engine for real
+(not synthetic data) would mean waiting days or weeks for live ingestion to
+accumulate enough history.
+
+**Performance benchmarks caught a real ~40x regression, not a hypothetical
+one** (`src/orderbook/book.py`'s `depth()` and `total_size_within()`):
+both called `list(sorted_dict.items())` before slicing/filtering, which
+materializes the *entire* book before touching the part you actually
+wanted — O(total levels) instead of O(log n + levels requested).
+`SortedItemsView` supports direct slicing and `SortedDict.irange()` exists
+specifically for this. `tests/performance/test_orderbook_latency.py`
+measured `depth()` at ~200µs before the fix and ~5µs after, against a book
+with 1000 levels/side — the kind of thing that's invisible in a
+correctness test (both versions return the same answer) and only shows up
+when you actually measure. The benchmark's ceiling was tightened
+afterward specifically so the slow version would fail it if reintroduced.
+
 ## What's next (in order)
 
-1. **Backtesting engine** — mean-reversion + momentum strategies, walk-forward
-   splitting, execution against the reconstructed book, Sharpe/max-drawdown
-2. **Remaining test suites** — downsampling correctness, performance
-   benchmarks (write throughput, query latency, order-book update latency),
-   backtest validity (lookahead-bias check, slippage sanity), and the
-   connection-kill chaos test
+The four layers from the original scope, plus performance benchmarks, are
+complete. What's left is polish:
+
+1. **Wire OrderBookReplayer into scripts/run_backtest.py** — currently the
+   backtest runs with the documented flat-slippage fallback because it
+   needs book_events history reaching back over the bars under test, which
+   takes time to accumulate. Once you've run `scripts/run_pipeline.py` for
+   a while, swap in an `order_book_provider` callback backed by
+   `OrderBookReplayer` — see the comment in `run_backtest.py` for exactly
+   where.
+2. **Fix the position-sizing mismatch in the backtest demo** — the engine
+   defaults to a fixed 1.0-unit position size against $10,000 starting
+   cash. For BTC at current prices that's roughly 10x unconstrained
+   leverage, which is why a live run can show ±16% swings and a 40%
+   drawdown from a handful of trades — those numbers are real given the
+   sizing, but the sizing itself isn't a sane default. Worth switching to
+   fraction-of-equity sizing (e.g. risk a fixed % of current equity per
+   trade) before treating any Sharpe/drawdown numbers as meaningful.
+3. **Chaos test for the connection-kill scenario** — the malformed-message
+   half of chaos testing is done (Layer 1); "kill the WebSocket mid-stream,
+   assert clean resync" is best exercised as a semi-manual test against a
+   live connection (a mocked reconnect doesn't prove much) — worth writing
+   up as a documented manual test procedure alongside whatever automated
+   coverage is practical.
+4. **A thin API/CLI layer** over the Mongo repository (watchlists/alerts)
+   and the backtest engine, if you want this to be demoable end-to-end
+   rather than script-by-script.
 
 ## Project layout
 
 ```
 market-data-platform/
-├── docker-compose.yml          # TimescaleDB + Mongo, zero paid services
+├── docker-compose.yml          # TimescaleDB + Mongo
 ├── .env.example
 ├── requirements.txt
 ├── infra/
@@ -228,13 +359,13 @@ market-data-platform/
 ├── src/
 │   ├── config.py
 │   ├── common/
-│   │   ├── events.py            # normalized event types (the cross-layer contract)
-│   │   └── symbols.py           # BASE-QUOTE <-> exchange-native mapping
+│   │   ├── events.py             # normalized event types (the cross-layer contract)
+│   │   └── symbols.py            # BASE-QUOTE <-> exchange-native mapping
 │   ├── ingestion/
-│   │   ├── base.py              # reconnect/backoff contract + trigger_resync() hook
+│   │   ├── base.py               # reconnect/backoff contract + trigger_resync() hook
 │   │   ├── binance_client.py
-│   │   ├── coinbase_client.py   # uses level2_batch (unauthenticated) for L2 depth
-│   │   └── manager.py           # runs both concurrently, merges into one stream, request_resync()
+│   │   ├── coinbase_client.py    # uses level2_batch (unauthenticated) for L2 depth
+│   │   └── manager.py            # runs both concurrently, merges into one stream, request_resync()
 │   ├── storage/
 │   │   ├── timescale/writer.py   # batched trade inserts + COPY for book events
 │   │   └── mongo/
@@ -243,12 +374,25 @@ market-data-platform/
 │   ├── orderbook/
 │   │   ├── book.py               # exchange-agnostic L2 price-level store
 │   │   ├── reconciler.py         # per-exchange gap/out-of-order handling + resync trigger
-│   │   └── manager.py            # routes ingestion events to per (exchange,symbol) reconcilers
-│   └── backtest/                 # (next)
+│   │   ├── manager.py            # routes ingestion events to per (exchange,symbol) reconcilers
+│   │   └── replay.py             # rebuilds historical book state from book_events for backtesting
+│   └── backtest/
+│       ├── strategies/
+│       │   ├── base.py           # Strategy ABC -- lookahead prevented by construction
+│       │   ├── mean_reversion.py
+│       │   └── momentum.py
+│       ├── data.py               # TimescaleBarsSource / CsvBarsSource / synthetic generator
+│       ├── costs.py              # fixed-rate taker fee model
+│       ├── execution.py          # fills market orders by walking a reconstructed order book
+│       ├── walkforward.py        # sequential, non-overlapping train/test fold splitting
+│       ├── metrics.py            # Sharpe, max drawdown, buy-and-hold benchmark
+│       └── engine.py             # orchestrates signal -> execution -> fees -> metrics
 ├── scripts/
-│   ├── run_ingestion.py         # Layer 1 only: sanity-check the raw feed
-│   ├── run_pipeline.py          # Layer 1 + 2: ingestion streaming into TimescaleDB
-│   └── run_orderbook.py         # Layer 1 + 3: live top-of-book printer
+│   ├── run_ingestion.py                  # Layer 1 only: sanity-check the raw feed
+│   ├── run_pipeline.py                   # Layer 1 + 2: ingestion streaming into TimescaleDB
+│   ├── run_orderbook.py                  # Layer 1 + 3: live top-of-book printer
+│   ├── backfill_binance_klines.py        # free historical OHLCV, no key/account needed
+│   └── run_backtest.py                   # Layer 4: walk-forward backtest over both strategies
 └── tests/
     ├── correctness/
     │   ├── test_symbols.py
@@ -256,11 +400,22 @@ market-data-platform/
     │   ├── test_mongo_repository.py         # verified against mongomock
     │   ├── test_mongo_index_usage.py        # verified against real Mongo (skips otherwise)
     │   ├── test_orderbook.py                # order book vs. ground truth
-    │   └── test_orderbook_reconciliation.py # out-of-order/gap handling, both exchanges
+    │   ├── test_orderbook_reconciliation.py # out-of-order/gap handling, both exchanges
+    │   ├── test_orderbook_replay.py         # historical replay vs. ground truth (real Postgres)
+    │   └── test_strategies.py               # strategy signal logic
     ├── performance/
+    │   ├── _latency.py                   # shared measure()/measure_async() helper
+    │   ├── test_orderbook_latency.py     # apply_level, reconciled diff, depth() latency
+    │   ├── test_write_throughput.py      # trade (ON CONFLICT) vs. book_event (COPY) writes
+    │   └── test_query_latency.py         # indexed vs. unindexed query, EXPLAIN-verified
     ├── backtest_validity/
+    │   ├── test_lookahead.py             # corrupts future bars, confirms signal doesn't change
+    │   ├── test_walkforward_split.py     # fold sequencing/non-overlap validation
+    │   ├── test_execution_realism.py     # order-book-walk fills, partial fills, shortfalls
+    │   ├── test_slippage_fees.py         # fee proportionality, slippage vs. book depth
+    │   └── test_benchmark_comparison.py  # buy-and-hold baseline + Sharpe/drawdown correctness
     ├── chaos/
-    │   └── test_malformed_messages.py   # done: malformed-payload handling
+    │   └── test_malformed_messages.py    # done: malformed-payload handling
     └── fixtures/
-        └── plain_schema.sql             # Timescale schema mirrored for plain-Postgres testing
+        └── plain_schema.sql              # Timescale schema mirrored for plain-Postgres testing
 ```
