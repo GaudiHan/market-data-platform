@@ -91,18 +91,27 @@ pytest -v
 ```
 
 Most tests need no infra at all (parsing/handling logic, and Mongo
-repository logic via `mongomock`). Two integration test files talk to real
-services and skip cleanly if they're not reachable:
-- `tests/correctness/test_timescale_writer.py` — needs Postgres/Timescale.
-  Defaults to `postgresql://postgres:postgres@localhost:5432/marketdata_test`;
-  override with `TEST_POSTGRES_DSN` if needed. Against docker-compose's
-  Timescale container, first create that scratch DB:
-  `docker exec -it mdp_timescaledb createdb -U mdp marketdata_test` (or
-  just set `TEST_POSTGRES_DSN` to reuse the main `marketdata` DB).
+repository logic via `mongomock`). A few talk to real services and skip
+cleanly if they're not reachable:
+- `tests/correctness/test_timescale_writer.py`,
+  `tests/correctness/test_orderbook_replay.py`, `tests/performance/test_write_throughput.py`,
+  `tests/performance/test_query_latency.py` — need a scratch Postgres/Timescale
+  database. Default DSN (`postgresql://mdp:mdp_local_pw@localhost:5432/marketdata_test`)
+  matches this project's own `docker-compose.yml` credentials, so against
+  the containers here you only need to create the scratch database once —
+  it's a different database from your live `marketdata` one on purpose, so
+  running tests never truncates real collected data:
+  ```bash
+  docker exec -it mdp_timescaledb createdb -U mdp marketdata_test
+  ```
+  Override with `TEST_POSTGRES_DSN` if you're running Postgres elsewhere or
+  under different credentials.
 - `tests/correctness/test_mongo_index_usage.py` — needs real MongoDB (see
-  status table above for why). Defaults to matching `docker-compose`'s Mongo.
-- `tests/correctness/test_orderbook_replay.py`, `tests/performance/*` — same
-  Postgres dependency as the writer tests above.
+  status table above for why). Defaults to matching `docker-compose`'s Mongo
+  credentials directly — no setup step needed, it uses your live `marketdata`
+  Mongo database's `alert_rules` collection but only reads from it (and
+  writes to a separate `marketdata_index_test` DB it creates and drops
+  itself, never touching your real data).
 
 To see the actual benchmark numbers rather than just pass/fail (the perf
 tests print, but pytest swallows stdout by default):
@@ -112,6 +121,19 @@ pytest tests/performance -v -s
 ```
 
 ## Architecture decisions worth knowing about
+
+**Test defaults should match this project's own docker-compose, not a
+generic assumption** — found via your test run, not mine: all four
+Postgres-dependent test files defaulted `TEST_POSTGRES_DSN` to
+`postgres:postgres`, a generic superuser guess that doesn't match this
+project's actual `docker-compose.yml` credentials (`mdp`/`mdp_local_pw`).
+Against your containers, every one of those tests silently skipped instead
+of failing loudly — technically correct behavior (skip-if-unreachable is
+the intended design so the suite doesn't require infra), but a wrong
+default that produces 12 silent skips defeats the point of having the
+tests. Fixed by changing the default to match this project's own compose
+file exactly, so `docker compose up -d` plus one `createdb` call is enough
+for the full suite to run for real with zero configuration.
 
 **Common event schema, exchange-specific parsing isolated at the edge**
 (`src/common/events.py`, `src/ingestion/*_client.py`): every exchange client
@@ -350,7 +372,7 @@ complete. What's left is polish:
 
 ```
 market-data-platform/
-├── docker-compose.yml          # TimescaleDB + Mongo
+├── docker-compose.yml          # TimescaleDB + Mongo, zero paid services
 ├── .env.example
 ├── requirements.txt
 ├── infra/
@@ -359,13 +381,13 @@ market-data-platform/
 ├── src/
 │   ├── config.py
 │   ├── common/
-│   │   ├── events.py             # normalized event types (the cross-layer contract)
-│   │   └── symbols.py            # BASE-QUOTE <-> exchange-native mapping
+│   │   ├── events.py            # normalized event types (the cross-layer contract)
+│   │   └── symbols.py           # BASE-QUOTE <-> exchange-native mapping
 │   ├── ingestion/
-│   │   ├── base.py               # reconnect/backoff contract + trigger_resync() hook
+│   │   ├── base.py              # reconnect/backoff contract + trigger_resync() hook
 │   │   ├── binance_client.py
-│   │   ├── coinbase_client.py    # uses level2_batch (unauthenticated) for L2 depth
-│   │   └── manager.py            # runs both concurrently, merges into one stream, request_resync()
+│   │   ├── coinbase_client.py   # uses level2_batch (unauthenticated) for L2 depth
+│   │   └── manager.py           # runs both concurrently, merges into one stream, request_resync()
 │   ├── storage/
 │   │   ├── timescale/writer.py   # batched trade inserts + COPY for book events
 │   │   └── mongo/
@@ -388,11 +410,11 @@ market-data-platform/
 │       ├── metrics.py            # Sharpe, max drawdown, buy-and-hold benchmark
 │       └── engine.py             # orchestrates signal -> execution -> fees -> metrics
 ├── scripts/
-│   ├── run_ingestion.py                  # Layer 1 only: sanity-check the raw feed
-│   ├── run_pipeline.py                   # Layer 1 + 2: ingestion streaming into TimescaleDB
-│   ├── run_orderbook.py                  # Layer 1 + 3: live top-of-book printer
-│   ├── backfill_binance_klines.py        # free historical OHLCV, no key/account needed
-│   └── run_backtest.py                   # Layer 4: walk-forward backtest over both strategies
+│   ├── run_ingestion.py            # Layer 1 only: sanity-check the raw feed
+│   ├── run_pipeline.py             # Layer 1 + 2: ingestion streaming into TimescaleDB
+│   ├── run_orderbook.py            # Layer 1 + 3: live top-of-book printer
+│   ├── backfill_binance_klines.py  # free historical OHLCV, no key/account needed
+│   └── run_backtest.py             # Layer 4: walk-forward backtest over both strategies
 └── tests/
     ├── correctness/
     │   ├── test_symbols.py
@@ -404,18 +426,18 @@ market-data-platform/
     │   ├── test_orderbook_replay.py         # historical replay vs. ground truth (real Postgres)
     │   └── test_strategies.py               # strategy signal logic
     ├── performance/
-    │   ├── _latency.py                   # shared measure()/measure_async() helper
-    │   ├── test_orderbook_latency.py     # apply_level, reconciled diff, depth() latency
-    │   ├── test_write_throughput.py      # trade (ON CONFLICT) vs. book_event (COPY) writes
-    │   └── test_query_latency.py         # indexed vs. unindexed query, EXPLAIN-verified
+    │   ├── _latency.py                    # shared measure()/measure_async() helper
+    │   ├── test_orderbook_latency.py      # apply_level, reconciled diff, depth() latency
+    │   ├── test_write_throughput.py       # trade (ON CONFLICT) vs. book_event (COPY) writes
+    │   └── test_query_latency.py          # indexed vs. unindexed query, EXPLAIN-verified
     ├── backtest_validity/
-    │   ├── test_lookahead.py             # corrupts future bars, confirms signal doesn't change
-    │   ├── test_walkforward_split.py     # fold sequencing/non-overlap validation
-    │   ├── test_execution_realism.py     # order-book-walk fills, partial fills, shortfalls
-    │   ├── test_slippage_fees.py         # fee proportionality, slippage vs. book depth
-    │   └── test_benchmark_comparison.py  # buy-and-hold baseline + Sharpe/drawdown correctness
+    │   ├── test_lookahead.py              # corrupts future bars, confirms signal doesn't change
+    │   ├── test_walkforward_split.py      # fold sequencing/non-overlap validation
+    │   ├── test_execution_realism.py      # order-book-walk fills, partial fills, shortfalls
+    │   ├── test_slippage_fees.py          # fee proportionality, slippage vs. book depth
+    │   └── test_benchmark_comparison.py   # buy-and-hold baseline + Sharpe/drawdown correctness
     ├── chaos/
-    │   └── test_malformed_messages.py    # done: malformed-payload handling
+    │   └── test_malformed_messages.py   # done: malformed-payload handling
     └── fixtures/
-        └── plain_schema.sql              # Timescale schema mirrored for plain-Postgres testing
+        └── plain_schema.sql             # Timescale schema mirrored for plain-Postgres testing
 ```
