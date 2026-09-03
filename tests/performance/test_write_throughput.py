@@ -20,7 +20,7 @@ from src.storage.timescale.writer import TimescaleWriter
 from tests.performance._latency import measure_async
 
 TEST_DSN = os.getenv(
-    "TEST_POSTGRES_DSN", "postgresql://postgres:postgres@localhost:5432/marketdata_test"
+    "TEST_POSTGRES_DSN", "postgresql://mdp:mdp_local_pw@localhost:5432/marketdata_test"
 )
 SCHEMA_PATH = os.path.join(os.path.dirname(__file__), "..", "fixtures", "plain_schema.sql")
 
