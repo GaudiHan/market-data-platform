@@ -8,18 +8,18 @@ mechanical strategies against it with realistic execution simulation.
 Built to demonstrate database/schema design and market-microstructure
 understanding, not "call an API and plot a line."
 
-## Status: All four layers complete, plus performance benchmarks and a chaos test
+## Status: Complete -- all four layers, performance benchmarks, chaos test, real order-book execution wired into the backtest
 
 | Layer | Status |
 |---|---|
 | 1. Ingestion (Binance + Coinbase WS) | Done, tested |
 | 2. Storage (TimescaleDB + Mongo) | Done, tested — writers + repository wired up |
 | 3. Order book reconstruction | Done, tested — reconciliation + gap/resync handling |
-| 4. Backtesting engine | Done, tested — walk-forward, order-book execution, risk-adjusted metrics |
+| 4. Backtesting engine | Done, tested — walk-forward, real order-book execution, risk-adjusted metrics |
 | Performance benchmarks | Done — write throughput, query latency, order-book update latency |
 | Chaos test: connection kill mid-stream | Done — real local socket, both exchanges |
 
-Test coverage: **108 passed, 1 skipped** (109 total). The one skip needs
+Test coverage: **113 passed, 1 skipped** (114 total). The one skip needs
 live Postgres/Mongo not installable in the sandbox these files were built
 in (see below); it runs for real once you `docker compose up -d`.
 
@@ -47,7 +47,7 @@ differences. See the docstring in `coinbase_client.py` for the full story.
 ```bash
 cp .env.example .env          # defaults are fine for local use
 docker compose up -d          # starts TimescaleDB + Mongo, runs init scripts
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv && source .venv/Scripts/activate
 pip install -r requirements.txt
 ```
 
@@ -83,7 +83,11 @@ python -m scripts.run_backtest --symbol BTC-USD --interval 1h
 ```
 
 Prints walk-forward fold-by-fold results for both strategies: return,
-Sharpe, max drawdown, and a buy-and-hold benchmark for comparison.
+Sharpe, max drawdown, and a buy-and-hold benchmark for comparison. It also
+prints which execution mode it's using: real order-book replay if
+`scripts/run_pipeline.py` has accumulated `book_events` history for that
+exchange/symbol, or the documented flat-slippage fallback if not. Pass
+`--no-order-book` to force the fallback regardless.
 
 Run the test suite:
 
@@ -294,12 +298,12 @@ depth, not an input the backtest assumes. `OrderBookReplayer`
 (`src/orderbook/replay.py`) rebuilds historical book state from the
 persisted `book_events` log up to a cutoff timestamp, deliberately never
 touching the live reconciler (replaying already-validated history has no
-sequencing uncertainty to resolve — that's what the reconciler exists for on
-the live path). `scripts/run_backtest.py` doesn't wire this in yet by
-default, since it needs `book_events` history reaching back over the bars
-under test, which takes time to accumulate; it falls back to a documented
-flat-slippage model per bar until then (see `FALLBACK_SLIPPAGE_BPS` in
-`engine.py`) rather than silently pretending the execution is realistic
+sequencing uncertainty to resolve — that's what the reconciler exists for
+on the live path). `scripts/run_backtest.py` auto-detects whether
+`book_events` history exists for the chosen exchange/symbol and wires this
+in automatically when it does, falling back to a documented flat-slippage
+model per bar (see `FALLBACK_SLIPPAGE_BPS` in `engine.py`) when it
+doesn't, rather than silently pretending the execution is realistic
 when it isn't.
 
 **Walk-forward splitting exists even though the strategies don't fit
@@ -367,29 +371,50 @@ slower real-socket test ever ran, which is exactly the point of having
 both: the unit tests pin down `run_forever`'s own logic precisely and
 cheaply, the real-socket tests prove the whole stack recovers end-to-end.
 
-## What's next (in order)
+**Position sizing defaults to a fraction of current equity, not a fixed
+unit count** (`src/backtest/engine.py`): the original default (`fixed_units`,
+1.0 unit) meant a $10,000 account trading BTC at ~$100,000/unit was
+implicitly ~10x leveraged from the first trade — which is exactly what
+produced the unrealistic ±16% swings and 40% drawdowns seen in an early
+live run. The default `sizing_mode="equity_fraction"` instead targets
+`current_equity * position_fraction` notional exposure, so risk scales with
+account size and instrument price rather than being an arbitrary constant
+that happens to work at some price scales and not others.
+`sizing_mode="fixed_units"` is still available for cases where identical
+notional exposure across runs is genuinely what you want to compare — it's
+demoted from silent default to an explicit opt-in, not removed.
 
-The four layers from the original scope, performance benchmarks, and both
-chaos-test categories are complete. What's left is polish:
+**Order-book execution in the backtest is now real, auto-detected, and
+gracefully degrading** (`scripts/run_backtest.py`, `src/orderbook/replay.py`):
+the script checks whether TimescaleDB has any `book_events` rows for the
+chosen exchange/symbol; if so, it wires `OrderBookReplayer.reconstruct` in
+as `BacktestEngine`'s `order_book_provider` and trades execute against real
+historical depth. If not (a fresh setup, or `--no-order-book`), it falls
+back to the documented flat-slippage model with no crash and no silent
+wrong-mode surprise — the script prints which mode it's using either way.
+This required making `BacktestEngine.run` itself `async` (previously
+synchronous), since `OrderBookReplayer.reconstruct` is a real Postgres
+query via `asyncpg` — there's no clean way to call that from inside a
+sync function without either a second, redundant sync DB driver or a
+nested-event-loop hack, and this codebase is async-first everywhere else
+already. The change is backward compatible with synchronous providers too
+(`inspect.isawaitable` gates whether the result gets `await`ed), so
+`None` (no provider) and any future non-DB-backed provider still work
+unmodified.
 
-1. **Wire OrderBookReplayer into scripts/run_backtest.py** — currently the
-   backtest runs with the documented flat-slippage fallback because it
-   needs book_events history reaching back over the bars under test, which
-   takes time to accumulate. Once you've run `scripts/run_pipeline.py` for
-   a while, swap in an `order_book_provider` callback backed by
-   `OrderBookReplayer` — see the comment in `run_backtest.py` for exactly
-   where.
-2. **Fix the position-sizing mismatch in the backtest demo** — the engine
-   defaults to a fixed 1.0-unit position size against $10,000 starting
-   cash. For BTC at current prices that's roughly 10x unconstrained
-   leverage, which is why a live run can show ±16% swings and a 40%
-   drawdown from a handful of trades — those numbers are real given the
-   sizing, but the sizing itself isn't a sane default. Worth switching to
-   fraction-of-equity sizing (e.g. risk a fixed % of current equity per
-   trade) before treating any Sharpe/drawdown numbers as meaningful.
-3. **A thin API/CLI layer** over the Mongo repository (watchlists/alerts)
+## What's next (optional polish)
+
+Everything from the original scope, performance benchmarks, both chaos-test
+categories, real order-book backtest execution, and the position-sizing fix
+are complete. What's left is genuinely optional:
+
+1. **A thin API/CLI layer** over the Mongo repository (watchlists/alerts)
    and the backtest engine, if you want this to be demoable end-to-end
    rather than script-by-script.
+2. **More strategies / multi-exchange signals** (e.g. a cross-exchange
+   arbitrage detector comparing Binance vs. Coinbase top-of-book, which the
+   existing `OrderBookRegistry` already tracks both exchanges for) if you
+   want to extend the market-microstructure story further.
 
 ## Project layout
 
@@ -455,6 +480,7 @@ market-data-platform/
     │   └── test_query_latency.py          # indexed vs. unindexed query, EXPLAIN-verified
     ├── backtest_validity/
     │   ├── test_lookahead.py              # corrupts future bars, confirms signal doesn't change
+    │   ├── test_position_sizing.py        # equity_fraction default, fixed_units opt-in, leverage regression
     │   ├── test_walkforward_split.py      # fold sequencing/non-overlap validation
     │   ├── test_execution_realism.py      # order-book-walk fills, partial fills, shortfalls
     │   ├── test_slippage_fees.py          # fee proportionality, slippage vs. book depth

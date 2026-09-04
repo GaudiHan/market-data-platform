@@ -1,6 +1,6 @@
 # Ingestion
-websockets>=12.0 
-aiohttp>=3.9 
+websockets>=12.0
+aiohttp>=3.9
 python-dotenv>=1.0
 orjson>=3.9
 
@@ -12,8 +12,8 @@ pymongo>=4.6
 pandas>=2.1
 numpy>=1.26
 
-# Order book 
-sortedcontainers>=2.4
+# Order book
+sortedcontainers>=2.4  # O(log n) price-level inserts/removals, standard for L2 book reconstruction
 
 # Testing
 pytest>=8.0
