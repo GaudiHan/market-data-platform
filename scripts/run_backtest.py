@@ -9,6 +9,13 @@ Data source priority:
   2. TimescaleDB continuous aggregates, if the CSV isn't there
   3. Synthetic data, as a last-resort demo so this script always runs
 
+Execution model: if TimescaleDB has any book_events rows for the chosen
+exchange/symbol (accumulated by scripts/run_pipeline.py), trades are
+executed against the reconstructed historical order book via
+OrderBookReplayer -- real slippage from real depth, not an assumption.
+Otherwise it falls back to a documented flat-slippage model per bar. Pass
+--no-order-book to force the fallback even when book history exists.
+
 Usage:
     python -m scripts.backfill_binance_klines --symbol BTC-USD --interval 1h
     python -m scripts.run_backtest --symbol BTC-USD --interval 1h
@@ -28,6 +35,7 @@ from src.backtest.strategies.mean_reversion import MeanReversionStrategy
 from src.backtest.strategies.momentum import MomentumStrategy
 from src.backtest.walkforward import WalkForwardSplitter
 from src.config import settings
+from src.orderbook.replay import OrderBookReplayer
 
 PERIODS_PER_YEAR = {"1m": 60 * 24 * 365, "5m": 12 * 24 * 365, "15m": 4 * 24 * 365,
                      "1h": 24 * 365, "4h": 6 * 365, "1d": 365}
@@ -54,6 +62,41 @@ async def load_bars(symbol: str, interval: str, exchange: str):
     return make_synthetic_bars(n=500, seed=7)
 
 
+async def build_order_book_provider(exchange: str, symbol: str):
+    """Returns (provider, pool). provider is an async callable usable
+    directly as BacktestEngine.run's order_book_provider, or None if no
+    book_events history is available for this exchange/symbol -- in which
+    case the engine falls back to its documented flat-slippage model.
+    Caller is responsible for closing `pool` when done, if not None."""
+    import asyncpg
+
+    try:
+        pool = await asyncpg.create_pool(settings.timescale.dsn, min_size=1, max_size=3)
+    except Exception as exc:  # noqa: BLE001 -- no book-history execution is a graceful degradation, not a crash
+        print(f"No order-book history available ({exc.__class__.__name__}) -- using flat-slippage fallback.")
+        return None, None
+
+    async with pool.acquire() as conn:
+        row_count = await conn.fetchval(
+            "SELECT count(*) FROM book_events WHERE exchange = $1 AND symbol = $2", exchange, symbol,
+        )
+    if not row_count:
+        await pool.close()
+        print("TimescaleDB reachable but has no book_events for this symbol yet "
+              "(run scripts/run_pipeline.py for a while to accumulate some) "
+              "-- using flat-slippage fallback.")
+        return None, None
+
+    print(f"Found {row_count:,} book_events rows for {exchange}:{symbol} -- "
+          "executing trades against the reconstructed order book.")
+    replayer = OrderBookReplayer(pool)
+
+    async def provider(ts):
+        return await replayer.reconstruct(exchange, symbol, ts.to_pydatetime())
+
+    return provider, pool
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--symbol", default="BTC-USD")
@@ -61,6 +104,9 @@ async def main() -> None:
     parser.add_argument("--exchange", default="binance")
     parser.add_argument("--train-size", type=int, default=200)
     parser.add_argument("--test-size", type=int, default=100)
+    parser.add_argument("--no-order-book", action="store_true",
+                         help="Skip order-book execution even if book_events history exists "
+                              "(always use the flat-slippage fallback).")
     args = parser.parse_args()
 
     bars = await load_bars(args.symbol, args.interval, args.exchange)
@@ -73,23 +119,28 @@ async def main() -> None:
               f"(need >= {args.train_size + args.test_size}). Reduce --train-size/--test-size.")
         return
 
+    order_book_provider, pool = (None, None) if args.no_order_book else await build_order_book_provider(
+        args.exchange, args.symbol
+    )
+    print()
+
     engine = BacktestEngine(periods_per_year=PERIODS_PER_YEAR[args.interval])
     strategies = [MeanReversionStrategy(), MomentumStrategy()]
 
-    for strategy in strategies:
-        print(f"=== {strategy.name} ===")
-        for fold_i, fold in enumerate(folds):
-            # Note: no order_book_provider wired here -- that requires
-            # book_events history reaching back over the bars being tested,
-            # which live ingestion needs time to accumulate. The engine
-            # falls back to a documented flat slippage assumption per bar
-            # (see FALLBACK_SLIPPAGE_BPS in engine.py) until then. Wiring in
-            # OrderBookReplayer once you have enough history is a
-            # one-argument change to this call.
-            result = engine.run(bars, strategy, start_idx=fold.test_start, end_idx=fold.test_end)
-            print(f"  fold {fold_i} [{bars.index[fold.test_start]} .. {bars.index[fold.test_end - 1]}]: "
-                  f"{result.summary()}")
-        print()
+    try:
+        for strategy in strategies:
+            print(f"=== {strategy.name} ===")
+            for fold_i, fold in enumerate(folds):
+                result = await engine.run(
+                    bars, strategy, start_idx=fold.test_start, end_idx=fold.test_end,
+                    order_book_provider=order_book_provider,
+                )
+                print(f"  fold {fold_i} [{bars.index[fold.test_start]} .. {bars.index[fold.test_end - 1]}]: "
+                      f"{result.summary()}")
+            print()
+    finally:
+        if pool is not None:
+            await pool.close()
 
 
 if __name__ == "__main__":

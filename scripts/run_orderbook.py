@@ -1,7 +1,7 @@
 """
 Layer 1 + 3 wired together: streams live data from both exchanges into
-reconstructed L2 order books and periodically prints top-of-book so we can
-watch reconstruction happen and (if we kill your network briefly) watch it
+reconstructed L2 order books and periodically prints top-of-book so you can
+watch reconstruction happen and (if you kill your network briefly) watch it
 resync cleanly.
 
 Usage:
