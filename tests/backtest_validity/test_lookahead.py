@@ -6,6 +6,7 @@ it does, something is reading future data. If it can't (by construction,
 since generate_signal only ever receives bars.iloc[:i+1]), this proves it.
 """
 import numpy as np
+import pytest
 
 from src.backtest.data import make_synthetic_bars
 from src.backtest.engine import BacktestEngine
@@ -51,7 +52,8 @@ def test_momentum_signal_unaffected_by_corrupted_future_bars():
     assert signal_real == signal_corrupted
 
 
-def test_engine_equity_curve_at_a_given_bar_unaffected_by_corrupting_bars_after_it():
+@pytest.mark.asyncio
+async def test_engine_equity_curve_at_a_given_bar_unaffected_by_corrupting_bars_after_it():
     """Integration-level version of the same check: run the full engine up
     to bar N twice, once with real data and once with everything after N
     corrupted, and confirm the equity curve up to N is bit-for-bit
@@ -61,10 +63,10 @@ def test_engine_equity_curve_at_a_given_bar_unaffected_by_corrupting_bars_after_
     engine = BacktestEngine()
     cutoff = 100
 
-    result_real = engine.run(bars, strategy, start_idx=0, end_idx=cutoff)
+    result_real = await engine.run(bars, strategy, start_idx=0, end_idx=cutoff)
 
     corrupted = _corrupt_future(bars, cutoff)
-    result_corrupted = engine.run(corrupted, strategy, start_idx=0, end_idx=cutoff)
+    result_corrupted = await engine.run(corrupted, strategy, start_idx=0, end_idx=cutoff)
 
     pd_testing_equal = (result_real.equity_curve == result_corrupted.equity_curve).all()
     assert pd_testing_equal

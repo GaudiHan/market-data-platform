@@ -17,12 +17,13 @@ def test_buy_and_hold_return_zero_for_flat_or_degenerate_series():
     assert metrics.buy_and_hold_return(pd.Series([])) == 0.0
 
 
-def test_backtest_result_includes_benchmark_alongside_strategy_return():
+@pytest.mark.asyncio
+async def test_backtest_result_includes_benchmark_alongside_strategy_return():
     bars = make_synthetic_bars(n=200, trend=2.0, volatility=0.5, seed=5)
     engine = BacktestEngine()
     strategy = MomentumStrategy(fast=10, slow=30)
 
-    result = engine.run(bars, strategy)
+    result = await engine.run(bars, strategy)
 
     # The benchmark must be computed over the same evaluated window the
     # strategy was scored on, not the whole bars frame (which would include
