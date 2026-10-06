@@ -60,31 +60,7 @@ Run the test suite:
 pytest -v
 ```
 
-Most tests need no infra at all (parsing/handling logic, and Mongo
-repository logic via `mongomock`). A few talk to real services and skip
-cleanly if they're not reachable:
-- `tests/correctness/test_timescale_writer.py`,
-  `tests/correctness/test_orderbook_replay.py`, `tests/performance/test_write_throughput.py`,
-  `tests/performance/test_query_latency.py` — need a scratch Postgres/Timescale
-  database. Default DSN (`postgresql://mdp:mdp_local_pw@localhost:5432/marketdata_test`)
-  matches this project's own `docker-compose.yml` credentials, so against
-  the containers here you only need to create the scratch database once —
-  it's a different database from your live `marketdata` one on purpose, so
-  running tests never truncates real collected data:
-  ```bash
-  docker exec -it mdp_timescaledb createdb -U mdp marketdata_test
-  ```
-  Override with `TEST_POSTGRES_DSN` if you're running Postgres elsewhere or
-  under different credentials.
-- `tests/correctness/test_mongo_index_usage.py` — needs real MongoDB (see
-  status table above for why). Defaults to matching `docker-compose`'s Mongo
-  credentials directly — no setup step needed, it uses your live `marketdata`
-  Mongo database's `alert_rules` collection but only reads from it (and
-  writes to a separate `marketdata_index_test` DB it creates and drops
-  itself, never touching your real data).
-
-To see the actual benchmark numbers rather than just pass/fail (the perf
-tests print, but pytest swallows stdout by default):
+To see the actual benchmark numbers rather than just pass/fail:
 
 ```bash
 pytest tests/performance -v -s
@@ -98,8 +74,7 @@ Postgres-dependent test files defaulted `TEST_POSTGRES_DSN` to
 `postgres:postgres`, a generic superuser guess that doesn't match this
 project's actual `docker-compose.yml` credentials (`mdp`/`mdp_local_pw`).
 Against your containers, every one of those tests silently skipped instead
-of failing loudly — technically correct behavior (skip-if-unreachable is
-the intended design so the suite doesn't require infra), but a wrong
+of failing loudly (technically correct behavior) but a wrong
 default that produces 12 silent skips defeats the point of having the
 tests. Fixed by changing the default to match this project's own compose
 file exactly, so `docker compose up -d` plus one `createdb` call is enough
