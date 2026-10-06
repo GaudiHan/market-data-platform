@@ -8,39 +8,13 @@ mechanical strategies against it with realistic execution simulation.
 Built to demonstrate database/schema design and market-microstructure
 understanding, not "call an API and plot a line."
 
-## Status: Complete -- all four layers, performance benchmarks, chaos test, real order-book execution wired into the backtest
+## Zero-budget
 
-| Layer | Status |
-|---|---|
-| 1. Ingestion (Binance + Coinbase WS) | Done, tested |
-| 2. Storage (TimescaleDB + Mongo) | Done, tested — writers + repository wired up |
-| 3. Order book reconstruction | Done, tested — reconciliation + gap/resync handling |
-| 4. Backtesting engine | Done, tested — walk-forward, real order-book execution, risk-adjusted metrics |
-| Performance benchmarks | Done — write throughput, query latency, order-book update latency |
-| Chaos test: connection kill mid-stream | Done — real local socket, both exchanges |
-
-Test coverage: **113 passed, 1 skipped** (114 total). The one skip needs
-live Postgres/Mongo not installable in the sandbox these files were built
-in (see below); it runs for real once you `docker compose up -d`.
-
-## Zero-budget guarantee
-
-Everything here runs on your own machine for $0:
 - **TimescaleDB** and **MongoDB Community**: self-hosted via Docker, no cloud account
 - **Binance** (`stream.binance.com`) and **Coinbase Exchange** (`ws-feed.exchange.coinbase.com`)
   public market-data WebSocket feeds: no API key, no account, no auth at all
   needed for trade/order-book data (only *trading* requires keys, which this
-  project never does)
-
-One correction worth knowing about, **caught via a web search, not live
-testing** (this sandbox can't reach exchange domains, so I fact-checked
-instead): Coinbase's plain `level2` channel has required a signed API key
-since August 2023 — my original Layer 1 assumption that it was public was
-stale/wrong. The fix isn't to drop Coinbase order-book support, though:
-Coinbase documents `level2_batch` as an explicitly unauthenticated channel
-with identical `snapshot`/`l2update` message shapes (just batched every
-50ms server-side), so it's a one-line channel-name change with no parsing
-differences. See the docstring in `coinbase_client.py` for the full story.
+  project doesnt..)
 
 ## Setup
 
@@ -52,8 +26,7 @@ pip install -r requirements.txt
 ```
 
 Run ingestion standalone to verify both exchange connections come up and
-data flows (this is the thing I couldn't test from my sandbox — no outbound
-network to exchange domains there — so please run this first):
+data flows:
 
 ```bash
 python -m scripts.run_ingestion
@@ -69,25 +42,17 @@ To see the actual reconstructed order books rather than raw events:
 python -m scripts.run_orderbook
 ```
 
-Prints top-of-book (best bid/ask, spread, sync status) for both exchanges
-every 3 seconds. Watch the `[SYNCED]`/`[resyncing...]` tag — it should read
+Prints top-of-book (best bid/ask, spread, sync status) for both exchanges. 
+Watch the `[SYNCED]`/`[resyncing...]` tag — it should read
 `resyncing...` only briefly, right after startup, before settling to
 `SYNCED`.
 
-To run a backtest (works immediately with zero setup via a free historical
-data pull, or synthetic data as a last resort):
+To run a backtest:
 
 ```bash
 python -m scripts.backfill_binance_klines --symbol BTC-USD --interval 1h
 python -m scripts.run_backtest --symbol BTC-USD --interval 1h
 ```
-
-Prints walk-forward fold-by-fold results for both strategies: return,
-Sharpe, max drawdown, and a buy-and-hold benchmark for comparison. It also
-prints which execution mode it's using: real order-book replay if
-`scripts/run_pipeline.py` has accumulated `book_events` history for that
-exchange/symbol, or the documented flat-slippage fallback if not. Pass
-`--no-order-book` to force the fallback regardless.
 
 Run the test suite:
 
